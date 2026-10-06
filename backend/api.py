@@ -78,18 +78,24 @@ def require_login(fn):
     return wrapper
 
 
-def require_writer(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        user = current_user()
-        if user is None:
-            return jsonify({"detail": "未登录"}), 401
-        if user["role"] != "writer":
-            return jsonify({"detail": "仅测量员可提交收敛读数"}), 403
-        g.user = user
-        return fn(*args, **kwargs)
+def writer_only(message):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            user = current_user()
+            if user is None:
+                return jsonify({"detail": "未登录"}), 401
+            if user["role"] != "writer":
+                return jsonify({"detail": message}), 403
+            g.user = user
+            return fn(*args, **kwargs)
 
-    return wrapper
+        return wrapper
+
+    return decorator
+
+
+require_writer = writer_only("仅测量员可提交收敛读数")
 
 
 @app.get("/api/health")
@@ -147,5 +153,78 @@ def create_log():
         db.commit()
         db.refresh(row)
         return jsonify(row_dict(row)), 201
+    finally:
+        db.close()
+
+
+def parse_as_of(raw):
+    """截止时刻：接受 ISO 字符串，裸值按 UTC 计。解析失败返回 None。"""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+@app.post("/api/compare/recalc")
+@writer_only("巡检岗为只读岗位，不能报送对照重算")
+def compare_recalc():
+    """邻断面对照重算：两个桩号与截止时刻必须一起提交。
+
+    每侧取该桩号在截止时刻（含）之前最近一条已办结记录；任一侧没有
+    已办结记录时该侧与差值都返回空，不出假数。截止时刻之后的测点不算。
+    """
+    body = request.get_json(silent=True) or {}
+    left = (body.get("left") or "").strip()
+    right = (body.get("right") or "").strip()
+    as_of = parse_as_of(body.get("as_of"))
+    if not left or not right or as_of is None:
+        return jsonify({"detail": "重算与截止时刻必须一起提交：两个桩号和截止时刻都不能少"}), 400
+    if left == right:
+        return jsonify({"detail": "两个桩号不能相同"}), 400
+    db = SessionLocal()
+    try:
+        def latest_done(mark):
+            return (
+                db.query(ConvergenceLog)
+                .filter(
+                    ConvergenceLog.chainage == mark,
+                    ConvergenceLog.status == "done",
+                    ConvergenceLog.created_at <= as_of,
+                )
+                .order_by(ConvergenceLog.created_at.desc(), ConvergenceLog.id.desc())
+                .first()
+            )
+
+        left_row = latest_done(left)
+        right_row = latest_done(right)
+        diff_mm = None
+        harder = None
+        if left_row is not None and right_row is not None:
+            diff_mm = round(left_row.delta_mm - right_row.delta_mm, 3)
+            left_abs, right_abs = abs(left_row.delta_mm), abs(right_row.delta_mm)
+            if left_abs > right_abs:
+                harder = "left"
+            elif right_abs > left_abs:
+                harder = "right"
+            else:
+                harder = "tie"
+        return jsonify(
+            {
+                "left": row_dict(left_row) if left_row else None,
+                "right": row_dict(right_row) if right_row else None,
+                "diff_mm": diff_mm,
+                "harder": harder,
+                "as_of": as_of.isoformat(),
+                "recalculated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
     finally:
         db.close()
